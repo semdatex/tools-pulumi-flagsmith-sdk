@@ -1,0 +1,63 @@
+name: CI
+
+# Gates every change to the SDK. The actual definition of "good" lives in
+# scripts/gate.sh — install with zero lifecycle scripts, build, prove the
+# committed bin/ is reproducible from nothing, assert pins.yml describes the
+# built artifact, and run the runtime + consumer smoke tests. regenerate.yml
+# runs the same script before opening a proposal, so the two gates cannot
+# drift apart.
+#
+# tag.yml chains off this workflow: it only runs after a CI completion on
+# main, and only tags when that run succeeded. A red main cannot be tagged.
+#
+# Only GitHub-owned actions are used — the semdatex org restricts Actions to an
+# allow-list (`allowedActions: selected`); scripts and local tooling are not
+# subject to it.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    name: Verify SDK
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      # The tooling produces the SDK, so a syntax error here is exactly the
+      # failure that would strand the next regeneration. Cheap; always runs.
+      - name: Syntax-check the tooling
+        run: |
+          set -euo pipefail
+          for f in scripts/*.sh; do bash -n "$f" && echo "ok  $f"; done
+          for f in scripts/*.js; do node --check "$f" && echo "ok  $f"; done
+
+      # A proposal whose gate failed carries this marker (see regenerate.yml).
+      # Surface that state rather than going green next to a file that says the
+      # tree is broken; deleting the marker is part of fixing the branch.
+      - name: Fail while the build-failure marker is present
+        if: hashFiles('BUILD-FAILURE.md') != ''
+        run: |
+          echo "::error::BUILD-FAILURE.md is present — this branch is marked as a failed build."
+          echo "Fix the build, then delete BUILD-FAILURE.md to clear the marker."
+          sed -n '1,40p' BUILD-FAILURE.md
+          exit 1
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Gate
+        run: ./scripts/gate.sh --install ci --check-bin
