@@ -8,3 +8,8 @@ LICENSE linguist-generated=false
 .github/** linguist-generated=false
 docs/** linguist-generated=false
 scripts/** linguist-generated=false
+
+# pins.yml is the declared input to regeneration, not its output. CI rewrites it,
+# but a change here is the whole point of a proposal — it must never be collapsed
+# as generated noise in a review.
+pins.yml linguist-generated=false
