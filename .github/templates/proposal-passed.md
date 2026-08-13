@@ -24,10 +24,13 @@ smoke test. Its result is stamped on this commit as the `regenerate-gate` status
 
 ## After merging
 
-Once CI passes on `main`, `tag.yml` cuts `v${PROVIDER}-sdk.<n>`. Consumers pin it:
+Once CI passes on `main`, `tag.yml` cuts the next `v${PROVIDER}-sdk.<n>`. `<n>`
+counts SDK builds at this provider version, so it is not knowable until the merge
+lands — take the exact tag from
+[the tag list](https://github.com/${GITHUB_REPOSITORY}/tags) and pin it:
 
 ```bash
-npm install github:${GITHUB_REPOSITORY}#v${PROVIDER}-sdk.1
+npm install github:${GITHUB_REPOSITORY}#v${PROVIDER}-sdk.<n>
 ```
 
 ---
