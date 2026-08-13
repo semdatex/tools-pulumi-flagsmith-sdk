@@ -1,0 +1,574 @@
+name: Regenerate SDK
+
+# Watches upstream and PROPOSES new SDK builds. It never writes to main.
+#
+#   weekly cron ─▶ upstream newer than pins.yml? ── no ─▶ exit quietly
+#                          │ yes
+#                          ▼
+#            regenerate + run scripts/gate.sh INLINE
+#                          ▼
+#     open ONE PR containing the pins bump AND the built SDK together
+#                          ▼
+#         human reviews and merges ─▶ CI passes on main ─▶ tag.yml tags
+#
+# Why the gate runs here rather than as a PR check: GitHub does not start
+# workflows for events caused by the default GITHUB_TOKEN, so ci.yml will not
+# run on a PR this workflow opens. Verifying before the PR exists is the
+# stronger position anyway — a PR carrying a broken SDK is never created as a
+# mergeable proposal — but the result would be invisible, so the outcome is
+# stamped onto the PR head commit as the `regenerate-gate` commit status.
+# Reporting a status is permitted with GITHUB_TOKEN; only triggering workflows
+# is not. The gate itself is scripts/gate.sh, the same script ci.yml runs, so
+# the two cannot drift.
+#
+# When the gate FAILS the PR is still opened, deliberately: the likeliest
+# failure is upstream codegen drift that patch-sdk.sh refuses to guess at, and
+# a visible broken PR carrying its own reproduction beats a red cron run in an
+# inbox nobody reads. Such a PR is marked four ways — draft, failing commit
+# status, `build-failing` label, and a committed BUILD-FAILURE.md — and both
+# tag.yml and ci.yml refuse to treat any commit carrying that marker as good.
+#
+# A watchdog must fail loudly: if the upstream release lookup returns nothing
+# and no explicit version was supplied, the run FAILS — it does not report
+# "nothing to do", because an API outage and "you're up to date" must not look
+# identical.
+#
+# Nothing here ever resolves "latest" implicitly into main: the cron only
+# proposes, and adopting a version means merging a PR that edits pins.yml.
+#
+# Only GitHub-owned actions are used (org Actions allow-list); PRs are opened
+# with the `gh` CLI. No secrets, no Pulumi Cloud, no push access to main.
+
+on:
+  schedule:
+    # Mondays 04:17 UTC. Off-the-hour to avoid the scheduler's peak-minute queue.
+    #
+    # NOTE: GitHub disables cron in public repos after 60 days with no
+    # repository activity, and upstream ships roughly once a year — so expect
+    # this to need re-enabling (one click, after a warning email). The manual
+    # dispatch below is the reliable path.
+    - cron: "17 4 * * 1"
+  workflow_dispatch:
+    inputs:
+      provider_version:
+        description: "Provider version to build (blank = latest upstream release, or the declared pin when force is set)"
+        required: false
+        type: string
+      bridge_version:
+        description: "Bridge plugin version (blank = keep the pins.yml value)"
+        required: false
+        type: string
+      pulumi_version:
+        description: "Pulumi CLI version (blank = keep the pins.yml value)"
+        required: false
+        type: string
+      force:
+        description: "Propose even if the versions already match pins.yml, and re-propose versions a previous PR rejected"
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: regenerate
+  cancel-in-progress: false
+
+jobs:
+  # Decides WHAT to build and WHETHER to build at all. Everything here is
+  # cheap and read-only; the expensive, write-capable work lives in `propose`,
+  # gated once on this job's verdict instead of repeating the condition on
+  # every step.
+  check:
+    name: Check upstream
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      proceed: ${{ steps.decide.outputs.proceed }}
+      provider: ${{ steps.decide.outputs.provider }}
+      bridge: ${{ steps.decide.outputs.bridge }}
+      pulumi_cli: ${{ steps.decide.outputs.pulumi_cli }}
+      old_provider: ${{ steps.decide.outputs.old_provider }}
+      old_bridge: ${{ steps.decide.outputs.old_bridge }}
+      branch: ${{ steps.decide.outputs.branch }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve target versions and decide
+        id: decide
+        env:
+          GH_TOKEN: ${{ github.token }}
+          IN_PROVIDER: ${{ inputs.provider_version }}
+          IN_BRIDGE: ${{ inputs.bridge_version }}
+          IN_PULUMI: ${{ inputs.pulumi_version }}
+          FORCE: ${{ inputs.force }}
+        run: |
+          set -euo pipefail
+
+          # Fails loudly if pins.yml is missing, malformed, or has an empty pin.
+          cur_provider="$(./scripts/read-pins.sh provider)"
+          cur_bridge="$(./scripts/read-pins.sh bridge)"
+          cur_pulumi="$(./scripts/read-pins.sh pulumi_cli)"
+
+          # Upstream tags releases as vX.Y.Z; the registry coordinate is X.Y.Z.
+          latest_raw="$(gh api repos/flagsmith/terraform-provider-flagsmith/releases/latest \
+            --jq .tag_name 2>/dev/null || echo "")"
+          latest="${latest_raw#v}"
+          echo "Declared provider: $cur_provider | latest upstream release: ${latest:-lookup failed}"
+
+          # Resolve the provider target:
+          #   explicit input > (force ? the declared pin : the latest release).
+          # `force` means "rebuild what is declared", so it must not silently
+          # retarget to a newer upstream.
+          if [[ -n "$IN_PROVIDER" ]]; then
+            provider="$IN_PROVIDER"
+          elif [[ "$FORCE" == "true" ]]; then
+            provider="$cur_provider"
+          elif [[ -n "$latest" ]]; then
+            provider="$latest"
+          else
+            # The watchdog's one job is noticing releases; when it cannot see
+            # them, "nothing to do" would be a lie. Fail so someone looks.
+            echo "::error::Could not determine the latest upstream release and no provider_version was supplied."
+            echo "::error::An API outage must not be indistinguishable from 'up to date'."
+            exit 1
+          fi
+          bridge="${IN_BRIDGE:-$cur_bridge}"
+          pulumi_cli="${IN_PULUMI:-$cur_pulumi}"
+
+          # Dispatch inputs reach shell command lines and GITHUB_OUTPUT; hold
+          # them to the same version grammar read-pins.sh enforces so nothing
+          # shell-active (or newline-bearing) gets through. Only writers can
+          # dispatch, so this is consistency hardening, not a trust boundary.
+          version_re='^[0-9][0-9A-Za-z._+-]*$'
+          for v in "$provider" "$bridge"; do
+            if [[ ! "$v" =~ $version_re ]]; then
+              echo "::error::'$v' does not look like a version (expected e.g. 0.10.0, no leading 'v')."
+              exit 1
+            fi
+          done
+          if [[ -n "$pulumi_cli" && ! "$pulumi_cli" =~ ^v?[0-9][0-9A-Za-z._+-]*$ ]]; then
+            echo "::error::pulumi_version '$pulumi_cli' does not look like a version."
+            exit 1
+          fi
+
+          branch="propose/provider-${provider}-bridge-${bridge}"
+
+          proceed=true
+          reason=""
+          if [[ "$provider" == "$cur_provider" && "$bridge" == "$cur_bridge" && "$FORCE" != "true" ]]; then
+            proceed=false
+            reason="Already at provider $cur_provider / bridge $cur_bridge — nothing to propose."
+          else
+            # One proposal per version pair. An OPEN PR means a human has not
+            # dealt with the previous one; a CLOSED or MERGED one records an
+            # explicit human decision that a Monday cron must not overrule —
+            # only the force input may.
+            prs="$(gh pr list --head "$branch" --state all --json number,state)"
+            open_n="$(jq -r '[.[] | select(.state=="OPEN")][0].number // empty' <<<"$prs")"
+            prior_state="$(jq -r '[.[] | select(.state!="OPEN")][0].state // empty' <<<"$prs")"
+            if [[ -n "$open_n" ]]; then
+              proceed=false
+              reason="PR #${open_n} already proposes these versions and is awaiting review."
+            elif [[ -n "$prior_state" && "$FORCE" != "true" ]]; then
+              proceed=false
+              case "$prior_state" in
+                MERGED) reason="A proposal for these versions was already MERGED — pins.yml has likely been changed since; dispatch with force to re-propose." ;;
+                *)      reason="A proposal for these versions was previously CLOSED without merging — an explicit human 'no'; dispatch with force to overrule it." ;;
+              esac
+            fi
+          fi
+
+          if [[ -f package.json ]]; then
+            old_provider="$(node -p "require('./package.json').pulumi.parameterization.version")"
+            old_bridge="$(node -p "require('./package.json').pulumi.version")"
+          else
+            old_provider="none"
+            old_bridge="none"
+          fi
+
+          {
+            echo "proceed=$proceed"
+            echo "provider=$provider"
+            echo "bridge=$bridge"
+            echo "pulumi_cli=$pulumi_cli"
+            echo "old_provider=$old_provider"
+            echo "old_bridge=$old_bridge"
+            echo "branch=$branch"
+          } >> "$GITHUB_OUTPUT"
+
+          {
+            echo "### Flagsmith provider"
+            echo
+            echo "| | |"
+            echo "|---|---|"
+            echo "| Declared in \`pins.yml\` | \`$cur_provider\` |"
+            echo "| Latest upstream | \`${latest:-lookup failed}\` |"
+            echo "| Target for this run | \`$provider\` |"
+            echo
+            if [[ "$proceed" == "true" ]]; then
+              echo "Proposing a build — see the propose job."
+            else
+              echo "$reason"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+          [[ "$proceed" == "true" ]] || echo "::notice::$reason"
+
+  propose:
+    name: Regenerate, gate, open PR
+    needs: check
+    if: needs.check.outputs.proceed == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write # push the proposal branch
+      pull-requests: write # open the proposal PR
+      statuses: write # stamp the gate result on the PR head commit
+    steps:
+      - uses: actions/checkout@v4
+
+      # Deliberately no `cache: npm`: regeneration replaces package.json
+      # wholesale, so a lockfile-keyed cache cannot help and its absence must
+      # not fail the job.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install Pulumi CLI
+        id: pulumi
+        env:
+          PULUMI_VERSION: ${{ needs.check.outputs.pulumi_cli }}
+        run: |
+          set -euo pipefail
+          if [[ -n "$PULUMI_VERSION" ]]; then
+            # `pulumi version` reports v3.256.0, and that is the natural thing to
+            # copy into pins.yml — but the installer expects 3.256.0 and builds a
+            # bad download URL from a leading "v". Accept either form.
+            curl -fsSL https://get.pulumi.com | sh -s -- --version "${PULUMI_VERSION#v}"
+          else
+            curl -fsSL https://get.pulumi.com | sh
+          fi
+          echo "$HOME/.pulumi/bin" >> "$GITHUB_PATH"
+          installed="$("$HOME/.pulumi/bin/pulumi" version)"
+          echo "Installed Pulumi CLI: $installed"
+          echo "version=$installed" >> "$GITHUB_OUTPUT"
+
+          # A silently-ignored --version would defeat the point of pinning.
+          if [[ -n "$PULUMI_VERSION" && "${installed#v}" != "${PULUMI_VERSION#v}" ]]; then
+            echo "::error::Requested Pulumi CLI ${PULUMI_VERSION} but got ${installed}."
+            exit 1
+          fi
+
+      # Everything from here to "Evaluate gate" must NOT abort the job on
+      # failure: a failed gate still produces a PR, marked as broken. Each step
+      # records its own outcome and the evaluation step decides.
+      #
+      # All three pins are written — including pulumi_cli — so a dispatch
+      # override can never leave the declaration disagreeing with what actually
+      # produced the artifact. That is the promise pins.yml's header makes.
+      - name: Write the target pins
+        id: writepins
+        continue-on-error: true
+        env:
+          PROVIDER: ${{ needs.check.outputs.provider }}
+          BRIDGE: ${{ needs.check.outputs.bridge }}
+          PULUMI_CLI: ${{ needs.check.outputs.pulumi_cli }}
+        run: |
+          set -euo pipefail
+          sed -i -E "s|^provider:[[:space:]]*.*|provider: \"${PROVIDER}\"|" pins.yml
+          sed -i -E "s|^bridge:[[:space:]]*.*|bridge: \"${BRIDGE}\"|" pins.yml
+          sed -i -E "s|^pulumi_cli:[[:space:]]*.*|pulumi_cli: \"${PULUMI_CLI}\"|" pins.yml
+          # Verify through the same reader the workflow uses, so a botched
+          # rewrite fails here rather than silently shipping a wrong pins.yml.
+          [[ "$(./scripts/read-pins.sh provider)" == "$PROVIDER" ]]
+          [[ "$(./scripts/read-pins.sh bridge)" == "$BRIDGE" ]]
+          [[ "$(./scripts/read-pins.sh pulumi_cli)" == "$PULUMI_CLI" ]]
+
+      - name: Regenerate
+        id: regen
+        if: steps.writepins.outcome == 'success'
+        continue-on-error: true
+        env:
+          PROVIDER: ${{ needs.check.outputs.provider }}
+          BRIDGE: ${{ needs.check.outputs.bridge }}
+        run: |
+          set -o pipefail
+          ./scripts/regenerate.sh "$PROVIDER" "$BRIDGE" 2>&1 | tee -a gate-output.txt
+
+      # The same gate ci.yml runs, minus --check-bin (a changed bin/ is the
+      # point here) and with a plain install (codegen just rewrote package.json,
+      # so the committed lockfile is legitimately stale; the refreshed one
+      # becomes part of the proposal).
+      - name: Gate
+        id: gate
+        if: steps.regen.outcome == 'success'
+        continue-on-error: true
+        run: |
+          set -o pipefail
+          ./scripts/gate.sh --install install 2>&1 | tee -a gate-output.txt
+
+      # Collapse the individual outcomes into one verdict, and on failure write
+      # the marker file that makes the breakage self-documenting and blocks
+      # tagging. It is committed to the branch rather than only pasted into the
+      # PR body because Actions logs expire and a blocked proposal may sit for
+      # months.
+      - name: Evaluate gate
+        id: verdict
+        env:
+          PROVIDER: ${{ needs.check.outputs.provider }}
+          BRIDGE: ${{ needs.check.outputs.bridge }}
+          PULUMI_CLI: ${{ steps.pulumi.outputs.version }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          failed_stage=""
+          if [[ "${{ steps.writepins.outcome }}" != "success" ]]; then
+            failed_stage="writing pins.yml"
+          elif [[ "${{ steps.regen.outcome }}" != "success" ]]; then
+            failed_stage="regeneration (codegen / patch-sdk.sh / repackage.sh)"
+          elif [[ "${{ steps.gate.outcome }}" != "success" ]]; then
+            # gate.sh prints "gate: FAILED at stage: <stage>" as its last line.
+            failed_stage="gate: $(grep -oP '(?<=^gate: FAILED at stage: ).*' gate-output.txt | tail -1 || echo unknown)"
+          fi
+
+          if [[ -z "$failed_stage" ]]; then
+            echo "passed=true" >> "$GITHUB_OUTPUT"
+            rm -f gate-output.txt BUILD-FAILURE.md
+            echo "Gate passed."
+            exit 0
+          fi
+
+          echo "passed=false" >> "$GITHUB_OUTPUT"
+          echo "failed_stage=$failed_stage" >> "$GITHUB_OUTPUT"
+          echo "::warning::Gate failed at: ${failed_stage}. Opening a draft PR marked build-failing."
+
+          {
+            echo "# BUILD FAILING — do not merge, do not tag"
+            echo
+            echo "This branch was produced by the Regenerate SDK workflow, and **the build"
+            echo "gate did not pass**. It is opened as a draft so the breakage is visible and"
+            echo "reproducible rather than buried in an expired workflow log."
+            echo
+            echo "\`tag.yml\` refuses to cut a tag from any commit containing this file, and"
+            echo "\`ci.yml\` fails while it is present — so even a merge cannot turn this"
+            echo "into a release."
+            echo
+            echo "| | |"
+            echo "|---|---|"
+            echo "| Failed stage | ${failed_stage} |"
+            echo "| Provider | \`${PROVIDER}\` |"
+            echo "| Bridge | \`${BRIDGE}\` |"
+            echo "| Pulumi CLI | \`${PULUMI_CLI:-unknown}\` |"
+            echo "| Workflow run | ${RUN_URL} |"
+            echo
+            echo "## Most likely cause"
+            echo
+            echo "Upstream codegen drift. \`scripts/patch-sdk.sh\` works around a Pulumi"
+            echo "nodejs-codegen collision (the provider defines both \`flagsmith_feature\`"
+            echo "and \`flagsmith_feature_state\`, so \`index.ts\` exports \`FeatureState\`"
+            echo "twice). It deliberately refuses to guess when the generated shape stops"
+            echo "matching what it expects — see that script's header, and"
+            echo "\`docs/upstream-issue.md\`."
+            echo
+            echo "## To resolve"
+            echo
+            echo "1. Reproduce locally: \`scripts/regenerate.sh ${PROVIDER} ${BRIDGE}\`"
+            echo "2. Fix the tooling (usually \`patch-sdk.sh\`) on this branch."
+            echo "3. Push. \`ci.yml\` runs on a human push and will report the real result."
+            echo "4. Delete this file, remove the \`build-failing\` label, mark ready for review."
+            echo
+            echo "## Captured gate output"
+            echo
+            echo '```'
+            tail -c 60000 gate-output.txt 2>/dev/null || echo "(no output captured)"
+            echo '```'
+          } > BUILD-FAILURE.md
+          rm -f gate-output.txt
+
+      # Open the proposal. Runs for both verdicts; the difference is draft vs
+      # ready, the label, and the commit status stamped below.
+      #
+      # The branch name is deterministic, so a leftover remote branch from a
+      # closed or unmerged proposal would wedge a plain push forever. Force is
+      # safe precisely because the check job established that no OPEN PR points
+      # at this branch — anything on it is stale by definition.
+      - name: Open proposal PR
+        id: pr
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BRANCH: ${{ needs.check.outputs.branch }}
+          PROVIDER: ${{ needs.check.outputs.provider }}
+          BRIDGE: ${{ needs.check.outputs.bridge }}
+          OLD_PROVIDER: ${{ needs.check.outputs.old_provider }}
+          OLD_BRIDGE: ${{ needs.check.outputs.old_bridge }}
+          PULUMI_CLI: ${{ steps.pulumi.outputs.version }}
+          PASSED: ${{ steps.verdict.outputs.passed }}
+          FAILED_STAGE: ${{ steps.verdict.outputs.failed_stage }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+
+          if [[ -z "$(git status --porcelain)" ]]; then
+            echo "::notice::Regeneration produced no changes — nothing to propose."
+            echo "opened=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout -B "$BRANCH"
+          git add -A
+
+          if [[ "$PASSED" == "true" ]]; then
+            title="chore: SDK for provider ${PROVIDER}, bridge ${BRIDGE}"
+          else
+            title="[BUILD FAILING] SDK for provider ${PROVIDER}, bridge ${BRIDGE}"
+          fi
+
+          git commit -m "$title" -m "Proposed by the Regenerate SDK workflow (run ${GITHUB_RUN_ID}).
+
+          Provider: ${OLD_PROVIDER} -> ${PROVIDER}
+          Bridge:   ${OLD_BRIDGE} -> ${BRIDGE}
+          Gate:     ${PASSED:-false}
+
+          Provider-Version: ${PROVIDER}
+          Bridge-Version: ${BRIDGE}
+          Pulumi-CLI-Version: ${PULUMI_CLI:-unknown}"
+
+          git push --force -u origin "$BRANCH"
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+          if [[ "$PASSED" == "true" ]]; then
+            body="$(cat <<EOF
+          Proposes building the Flagsmith SDK at new versions. **Merging this leads to a release tag** once CI confirms the merge on \`main\`.
+
+          | Dimension | Before | After |
+          |---|---|---|
+          | Flagsmith provider | \`${OLD_PROVIDER}\` | \`${PROVIDER}\` |
+          | Bridge plugin | \`${OLD_BRIDGE}\` | \`${BRIDGE}\` |
+          | Pulumi CLI | | \`${PULUMI_CLI}\` |
+
+          Both the \`pins.yml\` bump and the generated SDK are in this one commit, so the
+          declaration and the artifact can never disagree.
+
+          ## Verification
+
+          \`scripts/gate.sh\` — the same gate \`ci.yml\` runs — passed in [the workflow run
+          that produced this PR](${RUN_URL}), **before** the PR existed: regeneration,
+          \`patch-sdk.sh\`, \`repackage.sh\` (which asserts the \`pulumi.parameterization\`
+          block), build, pins/artifact agreement, the runtime smoke test and the consumer
+          smoke test. Its result is stamped on this commit as the \`regenerate-gate\` status.
+
+          > [!NOTE]
+          > \`ci.yml\` does not start on this PR: GitHub does not trigger workflows for events
+          > caused by the default \`GITHUB_TOKEN\`. For an independent re-run on a fresh runner,
+          > **close and reopen this PR** — a human reopening does trigger it.
+
+          ## After merging
+
+          Once CI passes on \`main\`, \`tag.yml\` cuts \`v${PROVIDER}-sdk.<n>\`. Consumers pin it:
+
+          \`\`\`bash
+          npm install github:${GITHUB_REPOSITORY}#v${PROVIDER}-sdk.1
+          \`\`\`
+
+          ---
+          _Generated by [Claude Code](https://claude.ai/code)_
+          EOF
+          )"
+            gh pr create --base main --head "$BRANCH" --title "$title" --body "$body"
+          else
+            body="$(cat <<EOF
+          > [!WARNING]
+          > **The build gate did not pass. This PR is not mergeable as-is.**
+          > Failed at: **${FAILED_STAGE}**
+
+          Opened deliberately rather than failing silently: the likeliest cause is upstream
+          codegen drift, and a visible PR carrying its own reproduction beats a red cron run
+          in an inbox. See [\`BUILD-FAILURE.md\`](../blob/${BRANCH}/BUILD-FAILURE.md) on this
+          branch for the captured gate output and how to resolve it.
+
+          | Dimension | Before | Attempted |
+          |---|---|---|
+          | Flagsmith provider | \`${OLD_PROVIDER}\` | \`${PROVIDER}\` |
+          | Bridge plugin | \`${OLD_BRIDGE}\` | \`${BRIDGE}\` |
+          | Pulumi CLI | | \`${PULUMI_CLI:-unknown}\` |
+
+          [Workflow run](${RUN_URL})
+
+          ## Safety
+
+          Five independent barriers stop this becoming a release: it is a **draft**, the
+          \`regenerate-gate\` commit status is **failing**, it carries the **\`build-failing\`**
+          label, \`ci.yml\` **fails while \`BUILD-FAILURE.md\` exists**, and \`tag.yml\`
+          **refuses to tag any commit containing it** — and tags are only cut after a
+          successful CI run on \`main\` in the first place.
+
+          ## To resolve
+
+          Push fixes to this branch — \`ci.yml\` **does** run on a human push and will report
+          the real result. Then delete \`BUILD-FAILURE.md\`, drop the \`build-failing\` label,
+          and mark ready for review.
+
+          ---
+          _Generated by [Claude Code](https://claude.ai/code)_
+          EOF
+          )"
+            gh pr create --base main --head "$BRANCH" --title "$title" --body "$body" --draft
+            # The label is not managed as IaC, so create it on first use.
+            # Never fatal: the draft state, the failing commit status and
+            # BUILD-FAILURE.md already mark this PR without it.
+            gh label create "build-failing" \
+              --color "B60205" \
+              --description "Regeneration produced an SDK that does not build" 2>/dev/null || true
+            gh pr edit "$BRANCH" --add-label "build-failing" 2>/dev/null \
+              || echo "::notice::Could not apply the build-failing label; the draft state, commit status and BUILD-FAILURE.md still mark this PR."
+          fi
+
+          echo "opened=true" >> "$GITHUB_OUTPUT"
+
+      # Make the inline gate visible in the PR's merge box. GITHUB_TOKEN may not
+      # trigger workflows, but it may report a commit status.
+      - name: Stamp gate result on the commit
+        if: steps.pr.outputs.opened == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SHA: ${{ steps.pr.outputs.sha }}
+          PASSED: ${{ steps.verdict.outputs.passed }}
+          FAILED_STAGE: ${{ steps.verdict.outputs.failed_stage }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          if [[ "$PASSED" == "true" ]]; then
+            state=success
+            description="gate.sh passed: install, build, pins, smoke, consumer"
+          else
+            state=failure
+            description="failed at ${FAILED_STAGE}"
+          fi
+          gh api "repos/${GITHUB_REPOSITORY}/statuses/${SHA}" \
+            -f state="$state" \
+            -f context="regenerate-gate" \
+            -f description="${description:0:139}" \
+            -f target_url="$RUN_URL" >/dev/null
+          echo "Stamped ${state} on ${SHA}."
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "### Regenerate SDK"
+            echo
+            if [[ "${{ steps.pr.outputs.opened }}" != "true" ]]; then
+              echo "Regeneration produced no changes; no PR opened."
+            elif [[ "${{ steps.verdict.outputs.passed }}" == "true" ]]; then
+              echo "Proposal PR opened and **passing** — ready for review."
+            else
+              echo "Proposal PR opened as a **draft**, marked \`build-failing\`."
+              echo "Failed at: \`${{ steps.verdict.outputs.failed_stage }}\`."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"

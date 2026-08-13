@@ -1,0 +1,10 @@
+* linguist-generated
+
+# Hand-authored files in this repo — exempt from the blanket generated marking
+# above so they render normally in diffs and language stats.
+README.md linguist-generated=false
+LICENSE linguist-generated=false
+.gitattributes linguist-generated=false
+.github/** linguist-generated=false
+docs/** linguist-generated=false
+scripts/** linguist-generated=false
