@@ -2,31 +2,13 @@ name: Tag release
 
 # Cuts an immutable release tag once main provably builds.
 #
-# Tag scheme: v<provider>-sdk.<n>
-#   <provider> = the bridged Flagsmith provider version (== package.json version)
-#   <n>        = increments for regenerations that change the output WITHOUT a
-#                provider bump (bridge upgrade, patch change, packaging fix),
-#                and resets to 1 when the provider version changes.
+# It chains off CI rather than firing on push: a merge that breaks the build in
+# ANY way — not just ways the failure marker captures — must not receive a tag,
+# because tags are immutable and are what downstream repositories pin.
 #
-# TRIGGER: this deliberately does NOT run on push. It chains off the CI
-# workflow completing on main, and only proceeds when that run SUCCEEDED — so
-# a merge that breaks the build in any way (not just ways the failure marker
-# captures) cannot receive an immutable tag. Tags name commits that ci.yml has
-# actually verified. There is no paths filter and none is needed: the content
-# hash below already refuses to cut a second tag for identical SDK content, so
-# a docs-only merge costs a short run that correctly declines to tag.
-#
-# (workflow_run resolves against the workflow file on the default branch, so
-# this trigger becomes active once merged to main — which is also the only
-# place tags are cut from.)
-#
-# Why tagging is automated while committing is not: the content being tagged
-# has already passed human review, merge, and a green CI run on main. The tag
-# adds no new code — it names a verified commit.
-#
-# Tags are immutable: a repository ruleset (declared in infrastructure-root)
-# blocks updating and deleting any `v*-sdk.*` tag. So this workflow is careful
-# to be idempotent — it will not cut a second tag for identical SDK content.
+# No paths filter, and none is needed: next-tag.sh refuses to cut a second tag
+# for identical SDK content, so a docs-only merge costs a short run that
+# correctly declines. See docs/pipeline.md.
 
 on:
   workflow_run:
@@ -53,8 +35,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     # CI also completes on pull requests and on red runs; tag only after a
-    # SUCCESSFUL run on MAIN. Manual dispatch skips the gate deliberately —
-    # it is a human act against the current main tip.
+    # SUCCESSFUL run on main. Manual dispatch skips that gate deliberately — it
+    # is a human act against the current main tip.
     if: >-
       github.event_name == 'workflow_dispatch' ||
       (github.event.workflow_run.conclusion == 'success' &&
@@ -65,26 +47,20 @@ jobs:
       - uses: actions/checkout@v4
         with:
           # Tag exactly the commit CI verified, not whatever main has become by
-          # the time this runs; the hash-based dedup makes overlapping runs
-          # converge. Full history + tags: computing <n> needs every v*-sdk.*.
+          # now; the content-hash dedup makes overlapping runs converge.
+          # Full history + tags: computing <n> needs every existing v*-sdk.*.
           ref: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || '' }}
           fetch-depth: 0
 
-      # Last line of defence, behind the CI-success gate above: regenerate.yml
-      # commits BUILD-FAILURE.md when its gate fails, and a determined human
-      # could still merge that draft. A release tag is immutable and is what
-      # downstream repositories pin, so refuse to name a tree that says it is
-      # broken. Deleting the marker is part of fixing the branch, so this can
-      # never block a genuine release.
+      # Last line of defence behind the CI-success gate: a determined human
+      # could still mark a build-failing draft ready and merge it. Deleting the
+      # marker is part of fixing the branch, so this cannot block a real release.
       - name: Refuse to tag a known-broken tree
         run: |
           set -euo pipefail
           if [[ -f BUILD-FAILURE.md ]]; then
             echo "::error::BUILD-FAILURE.md is present on this commit — refusing to cut a release tag."
-            echo
-            echo "This tree was produced by a regeneration whose build gate failed."
             echo "Fix the build on a branch, delete BUILD-FAILURE.md, and merge that."
-            echo
             sed -n '1,40p' BUILD-FAILURE.md
             exit 1
           fi
@@ -94,69 +70,7 @@ jobs:
         id: next
         env:
           FORCE: ${{ inputs.force }}
-        run: |
-          set -euo pipefail
-
-          provider="$(node -p "require('./package.json').pulumi.parameterization.version")"
-          pkg_version="$(node -p "require('./package.json').version")"
-
-          if [[ "$provider" != "$pkg_version" ]]; then
-            echo "::error::package.json version ($pkg_version) != provider version ($provider)."
-            echo "This repo pins them equal; repackage.sh normally enforces it."
-            exit 1
-          fi
-
-          # Hash of the SDK artifact only — everything except repo scaffolding.
-          # A deny-list, so newly generated files are included automatically.
-          # pins.yml is excluded on purpose: it is the declaration, not the
-          # artifact — a comment-only edit there must not mint a new tag around
-          # byte-identical SDK content. (ls-tree prints "<hash> <path>", so the
-          # path alternation is anchored after the first space.)
-          sdk_hash() {
-            git ls-tree -r "$1" --format='%(objectname) %(path)' \
-              | grep -Ev '^[0-9a-f]+ (\.github/|docs/|scripts/|pins\.yml$|README\.md$|LICENSE$|BUILD-FAILURE\.md$|\.gitignore$|\.gitattributes$|package-lock\.json$)' \
-              | sort -k2 \
-              | sha256sum | cut -d' ' -f1
-          }
-
-          current_hash="$(sdk_hash HEAD)"
-          echo "SDK content hash: $current_hash"
-
-          # Highest existing <n> for this provider version.
-          highest=0
-          latest_tag=""
-          while read -r tag; do
-            [[ -z "$tag" ]] && continue
-            n="${tag##*-sdk.}"
-            if [[ "$n" =~ ^[0-9]+$ ]] && (( n > highest )); then
-              highest="$n"
-              latest_tag="$tag"
-            fi
-          done < <(git tag --list "v${provider}-sdk.*")
-
-          if [[ -n "$latest_tag" ]]; then
-            echo "Latest tag for provider $provider: $latest_tag"
-            if [[ "$(sdk_hash "$latest_tag")" == "$current_hash" && "$FORCE" != "true" ]]; then
-              echo "SDK content is identical to $latest_tag — not cutting a duplicate tag."
-              echo "should_tag=false" >> "$GITHUB_OUTPUT"
-              echo "tag=$latest_tag" >> "$GITHUB_OUTPUT"
-              exit 0
-            fi
-          else
-            echo "No existing tag for provider $provider — this will be .1"
-          fi
-
-          next="v${provider}-sdk.$(( highest + 1 ))"
-
-          if git rev-parse -q --verify "refs/tags/$next" >/dev/null; then
-            echo "::error::Tag $next already exists. Tags are immutable and cannot be moved."
-            exit 1
-          fi
-
-          echo "should_tag=true" >> "$GITHUB_OUTPUT"
-          echo "tag=$next" >> "$GITHUB_OUTPUT"
-          echo "provider=$provider" >> "$GITHUB_OUTPUT"
-          echo "Next tag: $next"
+        run: ./scripts/next-tag.sh
 
       - name: Push the tag
         if: steps.next.outputs.should_tag == 'true'
@@ -176,19 +90,20 @@ jobs:
 
       - name: Summary
         if: always()
+        env:
+          SHOULD_TAG: ${{ steps.next.outputs.should_tag }}
+          TAG: ${{ steps.next.outputs.tag }}
         run: |
           {
             echo "### Tag release"
             echo
-            if [[ "${{ steps.next.outputs.should_tag }}" == "true" ]]; then
-              echo "Cut \`${{ steps.next.outputs.tag }}\`."
-              echo
-              echo "Consumers pin it with:"
+            if [[ "$SHOULD_TAG" == "true" ]]; then
+              echo "Cut \`${TAG}\`. Consumers pin it with:"
               echo
               echo '```bash'
-              echo "npm install github:${{ github.repository }}#${{ steps.next.outputs.tag }}"
+              echo "npm install github:${GITHUB_REPOSITORY}#${TAG}"
               echo '```'
             else
-              echo "No tag cut — SDK content unchanged since \`${{ steps.next.outputs.tag }}\`."
+              echo "No tag cut — SDK content unchanged since \`${TAG}\`."
             fi
           } >> "$GITHUB_STEP_SUMMARY"

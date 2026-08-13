@@ -224,6 +224,10 @@ the cron won't overrule on its own).
 CI has **no write access to `main`** and holds no secrets. It pushes only its
 own proposal branches.
 
+The rest of this section is the summary. [`docs/pipeline.md`](docs/pipeline.md)
+is the long form — the reasoning behind each of these choices, and a map of
+which script does what.
+
 ### One gate, defined once
 
 The definition of "the SDK is good" lives in [`scripts/gate.sh`](scripts/gate.sh):
@@ -284,23 +288,19 @@ very artifact regeneration overwrites.
 
 - Never hand-edit versions in `package.json`. Change `pins.yml`.
 - `repackage.sh` asserts the built package matches the pins it was given.
-- On a pins-bump PR the two *intentionally* disagree until the post-merge build
-  converges them; the main build guarantees convergence on every push.
+- The two are only ever committed together, in one commit, so they cannot be
+  observed disagreeing on any branch — which is exactly what lets the gate treat
+  a mismatch as a hard failure rather than a transient state to tolerate.
 
 Older tags remain consumable forever, so different downstream repos can sit on
 different provider versions without this repository holding more than one.
 
-### The manual trigger
+### Keeping the watcher alive
 
-`workflow_dispatch` is a **dry run**: regenerate and verify at the declared pins
-(or one-off input overrides), report, commit nothing. Use it to confirm the
-pipeline still reproduces the committed SDK, or to trial a version before
-declaring it in `pins.yml`.
-
-**There is deliberately no schedule.** An unattended job would produce builds
-nobody asked for. The job summary does report the declared pin next to the
-latest upstream release, so you can see whether you are behind — but it never
-acts on that by itself.
+GitHub disables scheduled workflows in public repositories after **60 days
+without a commit**. Upstream ships roughly yearly, so expect the cron to lapse
+between releases — re-enable it from the Actions tab, and treat the manual
+dispatch as the path you can always rely on.
 
 ### Regenerating locally
 
@@ -313,7 +313,7 @@ git status                            # review the diff
 Requires the `pulumi` CLI plus egress to `get.pulumi.com` and
 `registry.opentofu.org`.
 
-### What the scripts do
+### What the regeneration scripts do
 
 | Script | Responsibility |
 |---|---|
@@ -325,6 +325,12 @@ Requires the `pulumi` CLI plus egress to `get.pulumi.com` and
 They are separate on purpose: `patch-sdk.sh` is a temporary bug workaround with a
 defined end of life, `repackage.sh` is permanent policy. Merging them would make
 the workaround impossible to retire cleanly.
+
+Those four are the chain you run by hand. The workflows call a further set —
+deciding what to build, gating it, opening the proposal, cutting the tag — which
+[`docs/pipeline.md`](docs/pipeline.md) inventories and explains. The workflow
+files themselves only wire steps together; every non-trivial line of shell lives
+in `scripts/`, where it can be read, linted and run outside CI.
 
 ## Attribution and license
 
