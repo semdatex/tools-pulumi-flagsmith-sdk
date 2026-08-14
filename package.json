@@ -1,5 +1,5 @@
 {
-    "name": "@pulumi/flagsmith",
+    "name": "@semdatex/pulumi-flagsmith",
     "version": "0.10.0",
     "description": "A Pulumi provider dynamically bridged from flagsmith.",
     "repository": "https://github.com/flagsmith/terraform-provider-flagsmith",

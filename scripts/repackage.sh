@@ -27,6 +27,13 @@
 #      is this repo's own documentation.
 #   5. `.gitattributes` keeps codegen's blanket `* linguist-generated` but
 #      exempts the hand-authored paths.
+#   6. The package is renamed to `@semdatex/pulumi-flagsmith`. Codegen emits
+#      `@pulumi/flagsmith`, but the `@pulumi` scope belongs to Pulumi — that
+#      name can never be published to npm, and it reads as an official package
+#      at every import site. Owning the scope keeps publishing a decision rather
+#      than a migration. The name is not load-bearing: resource tokens are
+#      `flagsmith:index/...` from the schema, and plugin resolution reads the
+#      `pulumi` block below, never `name`.
 #
 # It also ASSERTS the load-bearing `pulumi.parameterization` block survived
 # regeneration and matches the pins we expect — runtime plugin resolution
@@ -81,6 +88,11 @@ LICENSE linguist-generated=false
 .github/** linguist-generated=false
 docs/** linguist-generated=false
 scripts/** linguist-generated=false
+
+# pins.yml is the declared input to regeneration, not its output. CI rewrites it,
+# but a change here is the whole point of a proposal — it must never be collapsed
+# as generated noise in a review.
+pins.yml linguist-generated=false
 ATTRS
 
 # 1 + 2 + assertions on package.json.
@@ -137,6 +149,13 @@ if (remote.version !== expectedProvider) {
 }
 
 // --- Deviations --------------------------------------------------------------
+// 6. Our own scope. Codegen emits "@pulumi/flagsmith", which we can never
+// publish (the scope is Pulumi's) and which reads as official wherever it is
+// imported. Asserted rather than assumed: the consumer smoke test installs the
+// packed tarball under this name and compiles against it, so a rename that
+// broke module resolution fails the gate rather than a consumer.
+pkg.name = "@semdatex/pulumi-flagsmith";
+
 pkg.scripts = pkg.scripts ?? {};
 delete pkg.scripts.postinstall;
 delete pkg.scripts.prepare;      // npm runs `prepare` for git deps; must not exist.

@@ -57,7 +57,7 @@ echo "==> Installing the SDK with --ignore-scripts (zero lifecycle scripts)"
 npm install --silent --ignore-scripts "$TARBALL"
 
 echo "==> Confirming nothing was built at install time"
-if [[ ! -f node_modules/@pulumi/flagsmith/bin/index.js ]]; then
+if [[ ! -f node_modules/@semdatex/pulumi-flagsmith/bin/index.js ]]; then
   echo "consumer-smoke: FAILED — bin/index.js absent after an ignore-scripts install." >&2
   exit 1
 fi
@@ -81,7 +81,7 @@ JSON
 # A real consumer program: constructs resources, and touches the export surface
 # including the type-only alias the patch introduces.
 cat > consumer.ts <<'TS'
-import * as flagsmith from "@pulumi/flagsmith";
+import * as flagsmith from "@semdatex/pulumi-flagsmith";
 
 // Resource classes must be constructible with typed args. The property names
 // and types below are asserted against the shipped .d.ts, so a codegen change

@@ -46,7 +46,7 @@ const check = (name, fn) => {
   }
 };
 
-console.log("Loading @pulumi/flagsmith from committed build output...");
+console.log(`Loading ${require(path.join(root, "package.json")).name} from committed build output...`);
 const pkg = require(path.join(root, "package.json"));
 assert.strictEqual(pkg.main, "bin/index.js", "package.json main must point at bin/index.js");
 const flagsmith = require(path.join(root, pkg.main));

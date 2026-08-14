@@ -48,16 +48,24 @@ pulumi package gen-sdk \
 # The exact nesting under --out has varied across Pulumi releases
 # (`<out>/` vs `<out>/nodejs/`). Rather than hardcode a guess, find the
 # directory that actually holds the generated package.
+#
+# Identify it by the parameterization block, NOT by package name. Codegen names
+# the package "@pulumi/flagsmith" and repackage.sh renames it to
+# "@semdatex/pulumi-flagsmith" afterwards — so matching on either name here is a
+# trap: one is an upstream detail we do not control, the other is not yet true at
+# this point in the pipeline. The parameterization block is the thing that
+# actually identifies this as the Flagsmith bridge output, and repackage.sh
+# asserts it in full a few steps later.
 GEN=""
 while IFS= read -r candidate; do
-  if node -e "process.exit(JSON.parse(require('fs').readFileSync('$candidate','utf8')).name === '@pulumi/flagsmith' ? 0 : 1)" 2>/dev/null; then
+  if node -e "const p = JSON.parse(require('fs').readFileSync('$candidate','utf8')); process.exit(p?.pulumi?.parameterization?.name === 'flagsmith' ? 0 : 1)" 2>/dev/null; then
     GEN="$(dirname "$candidate")"
     break
   fi
 done < <(find "$WORK/out" -name package.json -not -path '*/node_modules/*' | sort)
 
 if [[ -z "$GEN" ]]; then
-  echo "regenerate: FAILED — could not find generated '@pulumi/flagsmith' package under $WORK/out." >&2
+  echo "regenerate: FAILED — could not find a generated package with a 'flagsmith' parameterization block under $WORK/out." >&2
   echo "Generated tree was:" >&2
   find "$WORK/out" -maxdepth 3 >&2
   exit 1
